@@ -19,6 +19,9 @@ struct TimeSpaceNetwork # TODO always make time the first index
 	# precalculate arc lookups to supply-demand linking variables
 	supply_demand_dual_arc_lookup::Matrix{Vector{Int64}}
 
+	# hack for fire models
+	start_time_period::Union{Int64, Nothing}
+
 end
 
 struct CrewRouteData
@@ -27,6 +30,7 @@ struct CrewRouteData
 	routes_per_crew::Vector{Int64}
 	route_costs::Matrix{Float64}
 	fires_fought::BitArray{4}
+	arcs_used::Matrix{Vector{Int64}}
 
 end
 
@@ -39,7 +43,9 @@ function CrewRouteData(
 
 	return CrewRouteData(num_crews, zeros(num_crews),
 		Matrix{Float64}(undef, num_crews, max_routes),
-		BitArray(undef, num_crews, max_routes, num_fires, num_time_periods) .> 2)
+		BitArray(undef, num_crews, max_routes, num_fires, num_time_periods) .> 2,
+		Matrix{Vector{Int64}}(undef, num_crews, max_routes),
+	)
 end
 
 struct FirePlanData
@@ -48,6 +54,7 @@ struct FirePlanData
 	plans_per_fire::Vector{Int64}
 	plan_costs::Matrix{Float64}
 	crews_present::Array{Int64, 3}
+	arcs_used::Matrix{Vector{Int64}}
 
 end
 
@@ -60,6 +67,7 @@ function FirePlanData(
 	return FirePlanData(num_fires, zeros(num_fires),
 		Matrix{Float64}(undef, num_fires, max_supp_plans),
 		zeros(Int64, (num_fires, max_supp_plans, num_time_periods)),
+		Matrix{Vector{Int64}}(undef, num_fires, max_supp_plans),
 	)
 end
 

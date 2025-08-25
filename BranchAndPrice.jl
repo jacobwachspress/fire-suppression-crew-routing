@@ -2,7 +2,7 @@ include("CommonStructs.jl")
 include("BranchingRules.jl")
 include("CuttingPlanes.jl")
 
-using Gurobi, Statistics, JSON
+using Gurobi, Statistics, JSON, NPZ
 
 mutable struct BranchAndBoundNode
 
@@ -87,7 +87,8 @@ function price_and_cut!!!!(
 	cut_search_enumeration_limit::Int64,
 	crew_rules::Vector{CrewAssignmentBranchingRule},
 	fire_rules::Vector{FireDemandBranchingRule},
-	global_fire_allotment_rules::Vector{GlobalFireAllotmentBranchingRule};
+	global_fire_allotment_rules::Vector{GlobalFireAllotmentBranchingRule},
+	fires_to_ignore::Vector{Int64};
 	gub_cover_cuts::Bool,
 	general_gub_cuts::String,
 	single_fire_cuts::Bool,
@@ -131,6 +132,7 @@ function price_and_cut!!!!(
 			crew_rules,
 			fire_rules,
 			global_fire_allotment_rules,
+			fires_to_ignore,
 			timing = log_flag,
 			upper_bound = upper_bound,
 			time_limit = time_limit,
@@ -156,7 +158,6 @@ function price_and_cut!!!!(
 				]),
 			)
 		end
-
 		loop_ix += 1
 
 		if loop_ix > loop_max
@@ -232,6 +233,8 @@ function branch_and_price(
 	num_fires::Int,
 	num_crews::Int,
 	num_time_periods::Int;
+	current_time = 0,
+	from_empirical = false,
 	line_per_crew = 20,
 	travel_speed = 640.0,
 	max_nodes = 10000,
@@ -258,19 +261,34 @@ function branch_and_price(
 	heuristic_single_fire_lift = false,
 	root_node_ip = false,
 	price_and_cut_file = nothing,
+	crew_routes = nothing,
+	fire_plans = nothing, 
+	crew_models  = nothing,
+	fire_models = nothing,
+	cut_data  = nothing,
 )
 	start_time = time()
 	root_node_ip_sol = 0.0
 	root_node_ip_sol_time = 0.0
 
-	@info "Initializing data structures"
-	# initialize input data
-	@time crew_routes, fire_plans, crew_models, fire_models, cut_data =
-		initialize_data_structures(num_fires, num_crews, num_time_periods, line_per_crew, travel_speed)
-	GC.gc()
-	algo_tracking ?
-	(@info "Checkpoint after initializing data structures" time() - start_time) :
-	nothing
+	if crew_routes === nothing
+		@info "Initializing data structures"
+		# initialize input data
+		@time crew_routes, fire_plans, crew_models, fire_models, cut_data =
+			initialize_data_structures(num_fires, num_crews, num_time_periods, line_per_crew, travel_speed, from_empirical = from_empirical)
+		GC.gc()
+		algo_tracking ?
+		(@info "Checkpoint after initializing data structures" time() - start_time) :
+		nothing
+	end
+
+	fires_to_ignore = Int64[]
+	for fire in 1:num_fires
+		if !isnothing(fire_models[fire].start_time_period) && fire_models[fire].start_time_period > current_time
+			push!(fires_to_ignore, fire)
+			@info "Ignoring fire" fire "because it starts at time" fire_models[fire].start_time_period
+		end
+	end
 
 	explored_nodes = []
 	ubs = []
@@ -294,6 +312,8 @@ function branch_and_price(
 	ub_ix::Int = -1
 	routes_best_sol = nothing
 	plans_best_sol = nothing
+	fire_arcs_used = nothing
+	crew_arcs_used = nothing
 
 	## breadth-first search for now, can get smarter/add options
 
@@ -339,6 +359,7 @@ function branch_and_price(
 			cut_search_enumeration_limit,
 			nothing,
 			GRB_ENV,
+			fires_to_ignore = fires_to_ignore,
 			price_and_cut_soft_time_limit = price_and_cut_soft_time_limit,
 			cut_loop_max = cut_loop_max,
 			relative_improvement_cut_req = relative_improvement_cut_req,
@@ -372,6 +393,7 @@ function branch_and_price(
 					fire_models,
 					cut_search_enumeration_limit,
 					GRB_ENV,
+					fires_to_ignore = fires_to_ignore,
 					routes_best_sol = routes_best_sol,
 					plans_best_sol = plans_best_sol,
 					price_and_cut_soft_time_limit = price_and_cut_soft_time_limit,
@@ -394,7 +416,12 @@ function branch_and_price(
 			nodes[node_ix].heuristic_found_master_problem = ub_rmp
 
 			if heuristic_ub < nodes[node_ix].u_bound
-				nodes[node_ix].u_bound = heuristic_ub
+				# nodes[node_ix].u_bound = heuristic_ub
+
+				# fire_arcs_used, crew_arcs_used = get_fire_and_crew_arcs_used(ub_rmp,
+				# 	crew_routes,
+				# 	fire_plans,
+				# )
 			end
 		end
 
@@ -417,6 +444,49 @@ function branch_and_price(
 		# a better solution than the incumbent
 		# TODO keep track if it comes from heuristic or no
 		if nodes[node_ix].u_bound < ub
+
+			fire_allots, crew_allots = get_fire_and_crew_incumbent_weighted_average(nodes[node_ix].master_problem,
+				crew_routes,
+				fire_plans,
+			)
+			fire_cost, crew_cost = get_cost_due_to_fires_and_crews(nodes[node_ix].master_problem,
+				crew_routes,
+				fire_plans,
+			)
+			fire_arcs_used, crew_arcs_used = get_fire_and_crew_arcs_used(nodes[node_ix].master_problem,
+				crew_routes,
+				fire_plans,
+			)
+
+			# if it is not a directory, make the directory data/output
+			isdir("data/output") || mkdir("data/output")
+
+			# extract the arc data from the subproblems
+			for fire in 1:num_fires
+				arcs_used = fire_arcs_used[fire]
+				arcs_used = reverse(arcs_used)
+				restricted_long_arcs = fire_models[fire].long_arcs[arcs_used, :]
+				restricted_costs = fire_models[fire].arc_costs[arcs_used]
+				# remove the first column, which is extraneous
+				restricted_long_arcs = restricted_long_arcs[:, 2:end]
+				NPZ.npzwrite("data/output/fire_$(fire)_arcs.npy", restricted_long_arcs)
+				NPZ.npzwrite("data/output/fire_$(fire)_costs.npy", restricted_costs)
+			end
+
+			for crew in 1:num_crews
+				arcs_used = crew_arcs_used[crew]
+				arcs_used = reverse(arcs_used)
+				restricted_long_arcs = crew_models[crew].long_arcs[arcs_used, :]
+				# remove the first column, which is extraneous
+				restricted_long_arcs = restricted_long_arcs[:, 2:end]
+				restricted_costs = crew_models[crew].arc_costs[arcs_used]
+				NPZ.npzwrite("data/output/crew_$(crew)_arcs.npy", restricted_long_arcs)
+				NPZ.npzwrite("data/output/crew_$(crew)_costs.npy", restricted_costs)
+			end
+
+			@info "new incumbent" fire_allots crew_allots fire_cost crew_cost fire_arcs_used crew_arcs_used
+
+
 			ub = nodes[node_ix].u_bound
 			ub_ix = node_ix
 		end
@@ -468,7 +538,7 @@ function branch_and_price(
 		end
 	end
 
-	return explored_nodes, ubs, lbs, columns, heuristic_times, times, time_1, root_node_ip_sol, root_node_ip_sol_time
+	return explored_nodes, ubs, lbs, columns, heuristic_times, times, time_1, root_node_ip_sol, root_node_ip_sol_time, fire_arcs_used, crew_arcs_used
 
 end
 
@@ -477,23 +547,33 @@ function initialize_data_structures(
 	num_crews::Int64,
 	num_time_periods::Int64,
 	line_per_crew::Int64,
-	travel_speed::Float64
+	travel_speed::Float64;
+	from_empirical = false
 )
-	crew_models = build_crew_models(
-		"data/raw/big_fire",
-		num_fires,
-		num_crews,
-		num_time_periods,
-		travel_speed,
-	)
+	if !from_empirical
+		crew_models = build_crew_models(
+			"data/raw/big_fire",
+			num_fires,
+			num_crews,
+			num_time_periods,
+			travel_speed,
+		)
 
-	fire_models = build_fire_models(
-		"data/raw/big_fire",
-		num_fires,
-		num_crews,
-		num_time_periods,
-		line_per_crew
-	)
+		fire_models = build_fire_models(
+			"data/raw/big_fire",
+			num_fires,
+			num_crews,
+			num_time_periods,
+			line_per_crew
+		)
+	else
+		crew_models = build_crew_models_from_empirical(
+			num_crews, num_fires, num_time_periods, travel_speed
+		)
+		fire_models = build_fire_models_from_empirical(
+			num_fires, num_crews, num_time_periods
+		)
+	end
 
 
 	crew_routes = CrewRouteData(Int(floor(6 * 1e6 / num_crews)), num_fires, num_crews, num_time_periods)
@@ -905,6 +985,7 @@ function heuristic_upper_bound!!(
 	single_fire_cuts,
 	decrease_gub_allots,
 	single_fire_lift,
+	fires_to_ignore = Int64[],
 	routes_best_sol = nothing,
 	plans_best_sol = nothing,
 )
@@ -927,6 +1008,12 @@ function heuristic_upper_bound!!(
 			[i[1] for i in eachindex(explored_bb_node.master_problem.plans[j, :])]
 			for j ∈ 1:num_fires
 		]
+	if isempty(crew_ixs)
+		crew_ixs = [Int64[] for crew in 1:num_crews]
+	end
+	if isempty(fire_ixs)
+		fire_ixs = [Int64[] for fire in 1:num_fires]
+	end
 
 	# add in columns from best solution
 	if ~isnothing(routes_best_sol)
@@ -1011,10 +1098,10 @@ function heuristic_upper_bound!!(
 
 		@info "entering heuristic round" branching_rule.allotment_matrix
 		for rule in crew_rules
-			@info "crew rule" rule
+			@info "crew rule" rule crew_ixs
 		end
 		for rule in fire_rules
-			@info "fire rule" rule
+			@info "fire rule" rule fire_ixs
 		end
 		rmp = define_restricted_master_problem(
 			gurobi_env,
@@ -1025,6 +1112,7 @@ function heuristic_upper_bound!!(
 			cut_data,
 			global_rules,
 			false,
+			fires_to_ignore,
 		)
 
 
@@ -1040,6 +1128,7 @@ function heuristic_upper_bound!!(
 			crew_rules,
 			fire_rules,
 			global_rules,
+			fires_to_ignore,
 			soft_time_limit = price_and_cut_soft_time_limit,
 			loop_max = cut_loop_max,
 			relative_improvement_cut_req = relative_improvement_cut_req,
@@ -1167,9 +1256,10 @@ function explore_node!!(
 	decrease_gub_allots,
 	single_fire_lift,
 	log_cuts_file,
+	fires_to_ignore,
 	rel_tol = 1e-9)
 
-	@info "Exploring node" branch_and_bound_node.ix
+	@info "Exploring node" branch_and_bound_node.ix fires_to_ignore
 
 	deferral_stabilization = false
 	# gather global information
@@ -1179,6 +1269,8 @@ function explore_node!!(
 
 	# if we are at the root node, there are no columns yet, and stabilization applies
 	if isnothing(branch_and_bound_node.parent)
+
+		# TODO in sequential optimization, we can use the solution found at the prior time step
 		crew_ixs = [Int[] for i ∈ 1:num_crews]
 		fire_ixs = [Int[] for i ∈ 1:num_fires]
 		deferral_stabilization = true
@@ -1276,6 +1368,7 @@ function explore_node!!(
 		cut_data,
 		global_rules,
 		deferral_stabilization,
+		fires_to_ignore,
 	)
 	@info "Define rmp time (b-and-b)" t
 
@@ -1290,6 +1383,7 @@ function explore_node!!(
 		crew_rules,
 		fire_rules,
 		global_rules,
+		fires_to_ignore,
 		soft_time_limit = price_and_cut_soft_time_limit,
 		loop_max = cut_loop_max,
 		relative_improvement_cut_req = relative_improvement_cut_req,

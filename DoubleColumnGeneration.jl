@@ -44,7 +44,8 @@ function double_column_generation!!!!(
 	fire_subproblems::Vector{TimeSpaceNetwork},
 	crew_branching_rules::Vector{CrewAssignmentBranchingRule},
 	fire_branching_rules::Vector{FireDemandBranchingRule},
-	global_fire_allotment_branching_rules::Vector{GlobalFireAllotmentBranchingRule};
+	global_fire_allotment_branching_rules::Vector{GlobalFireAllotmentBranchingRule},
+	fires_to_ignore::Vector{Int64};
 	upper_bound::Float64,
 	timing::Bool,
 	time_limit::Float64 = Inf,
@@ -81,6 +82,18 @@ function double_column_generation!!!!(
 	# initialize column generation loop
 	continue_iterating::Bool = true
 	iteration = 0
+
+	# add in dummy plans for the fires_to_ignore
+	for fire in fires_to_ignore
+		add_column_to_master_problem!!(
+			rmp,
+			cut_data,
+			fire_plans,
+			global_fire_allotment_branching_rules,
+			fire,
+			1,
+		)
+	end
 
 	while continue_iterating
 
@@ -162,7 +175,7 @@ function double_column_generation!!!!(
 
 				# add the route to the routes
 				new_route_ix =
-					add_column_to_route_data!(crew_routes, crew, cost, fires_fought)
+					add_column_to_route_data!(crew_routes, crew, cost, fires_fought, arcs_used)
 
 				# update the master problem
 				add_column_to_master_problem!!(
@@ -184,7 +197,7 @@ function double_column_generation!!!!(
 		fire_arcs_used = [Int[] for fire ∈ 1:num_fires]
 
 		# for each fire
-		Threads.@threads for fire in 1:num_fires
+		Threads.@threads for fire in [g for g ∈ 1:num_fires if g ∉ fires_to_ignore]
 
 			# generate the local costs of the arcs
 			fire_subproblems[fire].prohibited_arcs .&= false
@@ -243,7 +256,7 @@ function double_column_generation!!!!(
 		
 
 
-		for fire ∈ 1:num_fires
+		for fire ∈ [fire for fire ∈ 1:num_fires if fire ∉ fires_to_ignore]
 
 			objective = fire_objectives[fire]
 			arcs_used = fire_arcs_used[fire]
@@ -265,7 +278,7 @@ function double_column_generation!!!!(
 
 				# add the plan to the plans
 				new_plan_ix =
-					add_column_to_plan_data!(fire_plans, fire, cost, crew_demands)
+					add_column_to_plan_data!(fire_plans, fire, cost, crew_demands, arcs_used)
 
 				@debug "fire plan" fire crew_demands
 				# update the master problem
@@ -445,8 +458,10 @@ function define_restricted_master_problem(
 	cut_data::CutData,
 	fire_allotment_branching_rules::Vector{GlobalFireAllotmentBranchingRule},
 	deferral_stabilization::Bool,
+	fires_to_ignore::Vector{Int64},
 	dual_warm_start::Union{Nothing, DualWarmStart} = nothing,
 )
+	@info "Define restricted master problem" fires_to_ignore
 
 	# get dimensions
 	num_crews, _, num_fires, num_time_periods = size(crew_route_data.fires_fought)
@@ -657,6 +672,14 @@ function define_restricted_master_problem(
 			plan[g, p] * fire_plan_data.plan_costs[g, p]
 			for g ∈ 1:num_fires, p ∈ fire_avail_ixs[g]
 		)
+
+		- 
+
+		# ignore fires that are not started yet
+		sum(
+			plan[g, p] * fire_plan_data.plan_costs[g, p] 
+			for g ∈ fires_to_ignore, p ∈ fire_avail_ixs[g]
+		)
 	)
 
 	return RestrictedMasterProblem(
@@ -701,6 +724,7 @@ function add_column_to_plan_data!(
 	fire::Int64,
 	cost::Float64,
 	crew_demands::Vector{Int64},
+	arcs_used::Vector{Int64},
 )
 	# add 1 to number of plans for this fire, store the index
 	plan_data.plans_per_fire[fire] += 1
@@ -711,6 +735,9 @@ function add_column_to_plan_data!(
 
 	# append the fires fought
 	plan_data.crews_present[fire, ix, :] = crew_demands
+
+	# append the arcs used
+	plan_data.arcs_used[fire, ix] = arcs_used
 
 	return ix
 
@@ -741,6 +768,7 @@ function add_column_to_route_data!(
 	crew::Int64,
 	cost::Float64,
 	fires_fought::BitArray{2},
+	arcs_used::Vector{Int64},
 )
 
 	# add 1 to number of routes for this crew, store the index
@@ -752,6 +780,9 @@ function add_column_to_route_data!(
 
 	# append the fires fought
 	route_data.fires_fought[crew, ix, :, :] = fires_fought
+
+	# append the arcs used
+	route_data.arcs_used[crew, ix] = arcs_used
 
 	return ix
 
@@ -994,4 +1025,75 @@ function get_fire_and_crew_incumbent_weighted_average(
 	)
 	crew_allotment = get_crew_incumbent_weighted_average(rmp, crew_routes)
 	return fire_allotment, crew_allotment
+end
+
+function get_cost_due_to_fires_and_crews(
+	solved_rmp::RestrictedMasterProblem,
+	crew_routes::CrewRouteData,
+	fire_plans::FirePlanData,
+)
+
+	# get problem dimensions
+	num_crews, _, num_fires, num_time_periods = size(crew_routes.fires_fought)
+
+	# get the cost due to fires
+	fire_cost = 0
+	for ix in eachindex(solved_rmp.plans)
+		if value(solved_rmp.plans[ix]) > 0
+			f = ix[1]
+			plan = ix[2]
+			fire_cost += value(solved_rmp.plans[ix]) * fire_plans.plan_costs[f, plan]
+		end
+	end
+
+	# get the cost due to crews
+	crew_cost = 0
+	for ix in eachindex(solved_rmp.routes)
+		if value(solved_rmp.routes[ix]) > 0
+			c = ix[1]
+			route = ix[2]
+			crew_cost += value(solved_rmp.routes[ix]) * crew_routes.route_costs[c, route]
+		end
+	end
+			
+
+	return fire_cost, crew_cost
+end
+
+function get_fire_and_crew_arcs_used(
+	solved_rmp::RestrictedMasterProblem,
+	crew_routes::CrewRouteData,
+	fire_plans::FirePlanData,
+)
+
+	# get problem dimensions
+	num_crews, _, num_fires, num_time_periods = size(crew_routes.fires_fought)
+
+	# get the arcs used by fires
+	fire_arcs_used = Vector{Vector{Int64}}(undef, num_fires)
+	for f in 1:num_fires
+		fire_arcs_used[f] = Int64[]
+	end
+	for ix in eachindex(solved_rmp.plans)
+		if value(solved_rmp.plans[ix]) > 0.99
+			f = ix[1]
+			plan = ix[2]
+			fire_arcs_used[f] = fire_plans.arcs_used[f, plan]
+		end
+	end
+
+	# get the arcs used by crews
+	crew_arcs_used = Vector{Vector{Int64}}(undef, num_crews)
+	for c in 1:num_crews
+		crew_arcs_used[c] = Int64[]
+	end
+	for ix in eachindex(solved_rmp.routes)
+		if value(solved_rmp.routes[ix]) > 0.99
+			c = ix[1]
+			route = ix[2]
+			crew_arcs_used[c] = crew_routes.arcs_used[c, route]
+		end
+	end
+
+	return fire_arcs_used, crew_arcs_used
 end
