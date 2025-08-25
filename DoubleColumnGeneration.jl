@@ -995,3 +995,36 @@ function get_fire_and_crew_incumbent_weighted_average(
 	crew_allotment = get_crew_incumbent_weighted_average(rmp, crew_routes)
 	return fire_allotment, crew_allotment
 end
+
+function get_cost_due_to_fires_and_crews(
+	solved_rmp::RestrictedMasterProblem,
+	crew_routes::CrewRouteData,
+	fire_plans::FirePlanData,
+)
+
+	# get problem dimensions
+	num_crews, _, num_fires, num_time_periods = size(crew_routes.fires_fought)
+
+	# get the cost due to fires
+	fire_cost = 0
+	for ix in eachindex(solved_rmp.plans)
+		if value(solved_rmp.plans[ix]) > 0
+			f = ix[1]
+			plan = ix[2]
+			fire_cost += value(solved_rmp.plans[ix]) * fire_plans.plan_costs[f, plan]
+		end
+	end
+
+	# get the cost due to crews
+	crew_cost = 0
+	for ix in eachindex(solved_rmp.routes)
+		if value(solved_rmp.routes[ix]) > 0
+			c = ix[1]
+			route = ix[2]
+			crew_cost += value(solved_rmp.routes[ix]) * crew_routes.route_costs[c, route]
+		end
+	end
+			
+
+	return fire_cost, crew_cost
+end

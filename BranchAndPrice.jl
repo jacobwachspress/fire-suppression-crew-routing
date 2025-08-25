@@ -2,7 +2,7 @@ include("CommonStructs.jl")
 include("BranchingRules.jl")
 include("CuttingPlanes.jl")
 
-using Gurobi, Statistics, JSON
+using Gurobi, Statistics, JSON, NPZ
 
 mutable struct BranchAndBoundNode
 
@@ -232,6 +232,7 @@ function branch_and_price(
 	num_fires::Int,
 	num_crews::Int,
 	num_time_periods::Int;
+	from_empirical = false,
 	line_per_crew = 20,
 	travel_speed = 640.0,
 	max_nodes = 10000,
@@ -266,7 +267,7 @@ function branch_and_price(
 	@info "Initializing data structures"
 	# initialize input data
 	@time crew_routes, fire_plans, crew_models, fire_models, cut_data =
-		initialize_data_structures(num_fires, num_crews, num_time_periods, line_per_crew, travel_speed)
+		initialize_data_structures(num_fires, num_crews, num_time_periods, line_per_crew, travel_speed, from_empirical = from_empirical)
 	GC.gc()
 	algo_tracking ?
 	(@info "Checkpoint after initializing data structures" time() - start_time) :
@@ -417,6 +418,20 @@ function branch_and_price(
 		# a better solution than the incumbent
 		# TODO keep track if it comes from heuristic or no
 		if nodes[node_ix].u_bound < ub
+
+			fire_allots, crew_allots = get_fire_and_crew_incumbent_weighted_average(nodes[node_ix].master_problem,
+				crew_routes,
+				fire_plans,
+			)
+			fire_cost, crew_cost = get_cost_due_to_fires_and_crews(nodes[node_ix].master_problem,
+				crew_routes,
+				fire_plans,
+			)
+			@info "new incumbent" fire_allots crew_allots fire_cost crew_cost
+
+			# write the fire allots and crew allots to a file that can be read by the plotting script
+			NPZ.npzwrite("fire_allots.npy", fire_allots)
+			NPZ.npzwrite("crew_allots.npy", crew_allots)
 			ub = nodes[node_ix].u_bound
 			ub_ix = node_ix
 		end
@@ -477,23 +492,33 @@ function initialize_data_structures(
 	num_crews::Int64,
 	num_time_periods::Int64,
 	line_per_crew::Int64,
-	travel_speed::Float64
+	travel_speed::Float64;
+	from_empirical = false
 )
-	crew_models = build_crew_models(
-		"data/raw/big_fire",
-		num_fires,
-		num_crews,
-		num_time_periods,
-		travel_speed,
-	)
+	if !from_empirical
+		crew_models = build_crew_models(
+			"data/raw/big_fire",
+			num_fires,
+			num_crews,
+			num_time_periods,
+			travel_speed,
+		)
 
-	fire_models = build_fire_models(
-		"data/raw/big_fire",
-		num_fires,
-		num_crews,
-		num_time_periods,
-		line_per_crew
-	)
+		fire_models = build_fire_models(
+			"data/raw/big_fire",
+			num_fires,
+			num_crews,
+			num_time_periods,
+			line_per_crew
+		)
+	else
+		crew_models = build_crew_models_from_empirical(
+			num_crews, num_fires, num_time_periods, travel_speed
+		)
+		fire_models = build_fire_models_from_empirical(
+			num_fires, num_crews, num_time_periods
+		)
+	end
 
 
 	crew_routes = CrewRouteData(Int(floor(6 * 1e6 / num_crews)), num_fires, num_crews, num_time_periods)

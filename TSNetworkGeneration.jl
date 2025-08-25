@@ -291,7 +291,7 @@ function get_static_crew_arc_costs(gd, arcs, cost_param_dict)
             ]
     end
 
-    return copy(costs) ./ 1e6 # divide by 1e-6 because Gurobi tolerance
+    return copy(costs) ./ 1e6 # divide by 1e6 because Gurobi tolerance
 end
 
 function crew_data_from_path(path, travel_speed::Float64)
@@ -457,6 +457,147 @@ function get_rest_penalties(
 
     return penalties
 end
+
+function build_crew_models_from_empirical(
+    num_crews::Int64, 
+    num_fires::Int64, 
+    num_time_periods::Int64,
+    travel_speed::Float64
+)
+
+    # read in the selected fires
+    fire_folder = "data/empirical_fire_models/raw/arc_arrays"
+    selected_fires = CSV.read(fire_folder * "/" * "selected_fires.csv", DataFrame)   
+
+    # read in the crew locations
+    tau_base_to_fire = CSV.read(fire_folder * "/../" * "consolidated_distances.csv", DataFrame)
+
+    # restrict to the fires whose fire_id is in the arc_file column of "selected_fires.csv"
+    tau_base_to_fire = tau_base_to_fire[findall(in(selected_fires[:, "fire_id"]), tau_base_to_fire[:, "fire_id"]), :]
+    
+    # turn the tau_base_to_fire into a matrix, dropping the columns names and the fire_id column
+    tau_base_to_fire = Matrix(tau_base_to_fire[:, 2:end])
+
+    # transpose the matrix so that the rows are the crews and the columns are the fires
+    tau_base_to_fire = copy(tau_base_to_fire')
+
+    # minutes to days
+    tau_base_to_fire = tau_base_to_fire / 60 / 24
+
+    # round to nearest integer, minimum 1 day
+    tau_base_to_fire = round.(Int, tau_base_to_fire) .+ 1
+
+    # get the distance from the bases to the fires, assuming travel speed is miles per day
+    base_fire_dists = tau_base_to_fire * travel_speed
+
+    # initialize travel times (number of periods) from fire f to fire g
+    tau = convert(Array{Int}, ones(num_fires, num_fires))
+
+    # TODO fix fire-distances
+    # for now they will all be the same, the mean of the base-fire distances
+    fire_dists = zeros(num_fires, num_fires)
+    dist = sum(base_fire_dists) / length(base_fire_dists)
+    for i in 1:num_fires
+        for j in 1:num_fires
+            if i != j
+                fire_dists[i, j] = dist
+            end
+        end
+    end
+
+    tau .+= Int.(round.(fire_dists ./ travel_speed))
+
+    # TODO make better crew starts
+    current_fire = [1, 2, 3, 1, 4, 5, 2, 3, -1, -1]
+    current_fire = repeat(current_fire, 100)
+    current_fire = current_fire[1:num_crews]
+    rest_by = [15, 15, 10, 10, 8, 8, 8, 5, 5, 4]
+    rest_by = repeat(rest_by, 100)
+    rest_by = rest_by[1:num_crews]
+    rested_periods = [-1, -1, -1, -1, -1, -1, -1, -1, 0, 1]
+    rested_periods = repeat(rested_periods, 100)
+    rested_periods = rested_periods[1:num_crews]
+
+    crew_status = LocationAndRestStatus(rest_by, current_fire, rested_periods)
+    dists_and_times = DistancesAndTravelTimes(fire_dists, base_fire_dists, tau, tau_base_to_fire)
+
+    arcs = generate_arcs(
+        dists_and_times,
+        crew_status,
+        num_crews,
+        num_fires,
+        num_time_periods,
+    )
+
+    rest_pen = get_rest_penalties(
+        num_crews,
+        num_time_periods,
+        crew_status.rest_by,
+        1e10,
+        positive,
+    )
+    ALPHA = 200
+    cost_params = Dict(
+        "cost_per_mile" => 1,
+        "rest_violation" => rest_pen,
+        "fight_fire" => ALPHA,
+    )
+
+    crew_sps = TimeSpaceNetwork[]
+    for crew in 1:num_crews
+
+        n_arcs = length(arcs[:, 1])
+        crew_arcs = arcs[[i for i in 1:n_arcs if arcs[i, CM.CREW_NUMBER] == crew], :]
+        crew_wide_arcs = collect(crew_arcs')
+        crew_arc_costs = get_static_crew_arc_costs(dists_and_times, crew_arcs, cost_params)
+        
+        # TODO refactor this function; it is returning stuff for all crews
+        constraint_data = define_network_constraint_data(crew_arcs, num_crews, num_fires, num_time_periods)
+
+        base_time = constraint_data.b_in[crew, :, :]
+        state_in_arcs = vcat(
+            constraint_data.f_in[crew, :, :, :],
+            reshape(base_time, (1, size(base_time)...)),
+        )[
+            :,
+            :,
+            :,
+        ]
+
+        base_time_out = constraint_data.b_out[crew, :, :]
+        state_out_arcs = vcat(
+            constraint_data.f_out[crew, :, :, :],
+            reshape(base_time_out, (1, size(base_time_out)...)),
+        )[
+            :,
+            :,
+            :,
+        ]
+
+        linking_dual_arc_lookup = Matrix{Vector{Int64}}(undef, num_fires, num_time_periods)
+        for g ∈ 1:num_fires
+            for t ∈ 1:num_time_periods
+                linking_dual_arc_lookup[g, t] = Int64[]
+            end
+        end
+
+        for i in 1:length(crew_arc_costs)
+            if (crew_arcs[i, CM.TO_TYPE] == CM.FIRE_CODE) && (crew_arcs[i, CM.TIME_TO] <= num_time_periods)
+                g = crew_arcs[i, CM.LOC_TO]
+                t = crew_arcs[i, CM.TIME_TO]
+                push!(linking_dual_arc_lookup[g, t], i)
+            end
+        end
+
+        crew_sp =
+            TimeSpaceNetwork(crew_arc_costs, state_in_arcs, state_out_arcs, "crew", crew_arcs, crew_wide_arcs, copy(crew_arc_costs), falses(length(crew_arc_costs)), linking_dual_arc_lookup)
+        push!(crew_sps, crew_sp)
+    end
+
+    return crew_sps
+end
+
+
 
 function build_crew_models(
     in_path::String,
@@ -949,5 +1090,123 @@ function build_fire_models(
     return fire_models
 end
 
+function build_fire_models_from_empirical(
+    num_fires::Int64, 
+    num_crews::Int64, 
+    num_time_periods::Int64,
+)
 
+    # initialize fire models
+    fire_models = TimeSpaceNetwork[]
 
+    # need +1 for the start arcs, tracking times {0, ..., T} but Julia uses 1-indexing
+    linking_dual_arc_lookup = Matrix{Vector{Int64}}(undef, num_fires, num_time_periods + 1)
+    for g ∈ 1:num_fires
+        for t ∈ 1:num_time_periods+1
+            linking_dual_arc_lookup[g, t] = Int64[]
+        end
+    end
+
+    # read in the selected fires
+    fire_folder = "data/empirical_fire_models/raw/arc_arrays"
+    selected_fires = CSV.read(fire_folder * "/" * "selected_fires.csv", DataFrame)
+
+    # read in the base-to-fire distances
+    base_fire_dists = CSV.read(fire_folder * "/../" * "consolidated_distances.csv", DataFrame)
+
+    # restrict to the fires whose fire_id is in the arc_file column of "selected_fires.csv"
+    base_fire_dists = base_fire_dists[findall(in(selected_fires[:, "fire_id"]), base_fire_dists[:, "fire_id"]), :]
+    
+    # turn the base_fire_dists into a matrix, dropping the columns names and the fire_id column
+    base_fire_dists = Matrix(base_fire_dists[:, 2:end])
+
+    # transpose the matrix so that the rows are the crews and the columns are the fires
+    base_fire_dists = copy(base_fire_dists')
+
+    # TODO fix fire-distances
+    # for now they will all be the same, the mean of the base-fire distances
+    fire_dists = zeros(num_fires, num_fires)
+    dist = sum(base_fire_dists) / length(base_fire_dists)
+    for i in 1:num_fires
+        for j in 1:num_fires
+            if i != j
+                fire_dists[i, j] = dist
+            end
+        end
+    end
+
+    for fire in 1:num_fires
+
+        # read in the arc array
+        fname = selected_fires[fire, "arc_file"]
+        arc_array = readdlm(fire_folder * "/" * fname, ',')
+
+        # divide the last column by 20 (number of personnel per crew)
+        arc_array[:, end] = arc_array[:, end] / 20
+
+        # cast to integer, rounding to nearest
+        arc_array = convert(Array{Int64}, round.(arc_array))
+
+        # need to append a dummy column to the left hand side
+        arc_array = hcat(convert.(Int, zeros(length(arc_array[:, 1]))) .- 1, arc_array)
+        
+        # read the arc costs
+        fname = selected_fires[fire, "cost_file"]
+        arc_costs = readdlm(fire_folder * "/" * fname, ',')
+
+        # we need to append a zero-cost arc for the start
+        start_location = arc_array[1, FM.STATE_FROM]
+        new_arc = [-1, start_location, 0, 1, start_location, 0]
+        arc_array = vcat(new_arc', arc_array)
+        arc_costs = vcat(0, arc_costs)
+
+        # we should cull the arrays and costs to only include arcs that are feasible
+        # for the given number of crews
+        feasible_arcs = [i for i in 1:length(arc_array[:, 1]) if arc_array[i, FM.TIME_FROM] <= num_time_periods]
+        arc_array = arc_array[feasible_arcs, :]
+        arc_costs = arc_costs[feasible_arcs]
+        feasible_arcs = [i for i in 1:length(arc_array[:, 1]) if arc_array[i, FM.CREWS_PRESENT] <= num_crews]
+        arc_array = arc_array[feasible_arcs, :]
+        arc_costs = arc_costs[feasible_arcs]
+
+        # normalize the costs
+        arc_costs = arc_costs ./ 1e4 # scale for Gurobi numerical tolerance
+
+        # we need to rename the states to be 1:s for some s
+        all_states = unique(vcat(arc_array[:, FM.STATE_FROM], arc_array[:, FM.STATE_TO]))
+        num_states = length(all_states)
+        state_dict = Dict()
+        for (i, state) in enumerate(all_states)
+            state_dict[state] = i
+        end
+        for i in 1:length(arc_array[:, 1])
+            arc_array[i, FM.STATE_FROM] = state_dict[arc_array[i, FM.STATE_FROM]]
+            arc_array[i, FM.STATE_TO] = state_dict[arc_array[i, FM.STATE_TO]]
+        end
+
+        # for each arc, we need to update the linking_dual_arc_lookup
+        for i ∈ 1:length(arc_costs)
+            t = arc_array[i, FM.TIME_FROM] + 1
+            push!(linking_dual_arc_lookup[fire, t], i)
+        end
+
+        # define the state_in_arcs and state_out_arcs
+        in_arcs = get_state_in_arcs(arc_array, num_states, num_time_periods)
+        out_arcs = get_state_out_arcs(arc_array, num_states, num_time_periods)
+   
+        fire_model = TimeSpaceNetwork(
+            arc_costs,
+            in_arcs,
+            out_arcs,
+            "fire",
+            arc_array,
+            collect(arc_array'),
+            copy(arc_costs),
+            falses(length(arc_costs)),
+            linking_dual_arc_lookup,
+        )
+        push!(fire_models, fire_model)
+    end
+
+    return fire_models
+end
